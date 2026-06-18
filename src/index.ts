@@ -6,6 +6,7 @@ export const FRONTIER_AST_REGISTRY_KIND = 'frontier.ast-walk.registry';
 export type FrontierAstImportKind = 'static' | 'side-effect' | 'export' | 'dynamic' | 'require' | string;
 export type FrontierAstExportKind = 'function' | 'class' | 'const' | 'let' | 'var' | 'type' | 'interface' | 'default' | 're-export' | string;
 export type FrontierAstDeclarationKind = 'function' | 'class' | 'const' | 'let' | 'var' | 'type' | 'interface' | string;
+export type FrontierAstSemanticOwnershipRegionKind = 'exported-declaration' | 're-export' | string;
 export type FrontierAstSourceLayer =
   | 'frontend-route'
   | 'frontend-component'
@@ -47,6 +48,7 @@ export interface FrontierAstImportRecord {
 export interface FrontierAstExportRecord {
   id: string;
   name: string;
+  localName?: string;
   kind: FrontierAstExportKind;
   source?: string;
   range: FrontierAstRange;
@@ -59,6 +61,22 @@ export interface FrontierAstDeclarationRecord {
   exported: boolean;
   async: boolean;
   range: FrontierAstRange;
+}
+
+export interface FrontierAstSemanticOwnershipRegionRecord {
+  id: string;
+  file: string;
+  kind: FrontierAstSemanticOwnershipRegionKind;
+  name: string;
+  stableKey: string;
+  owner?: string;
+  exportKind?: FrontierAstExportKind;
+  declarationKind?: FrontierAstDeclarationKind;
+  source?: string;
+  exportId?: string;
+  declarationId?: string;
+  range: FrontierAstRange;
+  tags: string[];
 }
 
 export interface FrontierAstCallRecord {
@@ -122,6 +140,7 @@ export interface FrontierAstSourceRecord {
   imports: FrontierAstImportRecord[];
   exports: FrontierAstExportRecord[];
   declarations: FrontierAstDeclarationRecord[];
+  semanticOwnershipRegions: FrontierAstSemanticOwnershipRegionRecord[];
   calls: FrontierAstCallRecord[];
   frontierPackages: string[];
   localImportSpecifiers: string[];
@@ -148,6 +167,7 @@ export interface FrontierAstSourceGraph {
     importCount: number;
     exportCount: number;
     declarationCount: number;
+    semanticOwnershipRegionCount: number;
     callCount: number;
     frontierPackageCount: number;
     businessLogicFindingCount: number;
@@ -232,6 +252,7 @@ export function walkFrontierSource(input: FrontierAstSourceInput, options: Front
   const imports = extractImports(text, stripped, file);
   const exports = extractExports(text, stripped, file);
   const declarations = extractDeclarations(stripped, file, exports);
+  const semanticOwnershipRegions = extractSemanticOwnershipRegions(text, stripped, file, exports, declarations, input.owner);
   const calls = extractCalls(stripped, file);
   const layer = input.layer ?? classifySourceLayer(file, options);
   const frontierPackages = unique(imports.map((item) => frontierPackageName(item.specifier)).filter(isString));
@@ -248,6 +269,7 @@ export function walkFrontierSource(input: FrontierAstSourceInput, options: Front
     imports,
     exports,
     declarations,
+    semanticOwnershipRegions,
     calls,
     frontierPackages,
     localImportSpecifiers,
@@ -287,6 +309,7 @@ export function walkFrontierSources(inputs: readonly (FrontierAstSourceInput | F
       importCount: sources.reduce((sum, source) => sum + source.imports.length, 0),
       exportCount: sources.reduce((sum, source) => sum + source.exports.length, 0),
       declarationCount: sources.reduce((sum, source) => sum + source.declarations.length, 0),
+      semanticOwnershipRegionCount: sources.reduce((sum, source) => sum + (source.semanticOwnershipRegions ?? []).length, 0),
       callCount: sources.reduce((sum, source) => sum + source.calls.length, 0),
       frontierPackageCount: frontierPackages.size,
       businessLogicFindingCount: sources.reduce((sum, source) => sum + source.businessLogic.length, 0)
@@ -385,6 +408,18 @@ export function createAstRegistryGraph(graph: FrontierAstSourceGraph): FrontierA
         metadata: declaration
       });
     }
+    for (const region of source.semanticOwnershipRegions ?? []) {
+      entries.push({
+        id: region.id,
+        kind: 'semantic-ownership-region',
+        source: source.file,
+        package: source.package,
+        feature: source.feature,
+        owner: region.owner ?? source.owner,
+        tags: region.tags,
+        metadata: region
+      });
+    }
     for (const finding of source.businessLogic) {
       entries.push({
         id: finding.id,
@@ -423,6 +458,7 @@ export function createAstLintResources(graph: FrontierAstSourceGraph): FrontierA
     metadata: {
       layer: source.layer,
       declarations: source.declarations.map((item) => item.name),
+      semanticOwnershipRegions: source.semanticOwnershipRegions ?? [],
       calls: source.calls.map((item) => item.name),
       businessLogic: source.businessLogic
     }
@@ -470,7 +506,7 @@ function extractImports(text: string, stripped: string, file: string): FrontierA
     const sideEffect = /^import\s+['"]/.test(raw.trim());
     add(specifier, sideEffect ? 'side-effect' : 'static', match.index, raw, typeOnly, importNames(raw));
   });
-  collectMatches(text, /\bexport\s+(?:type\s+)?(?:\*\s+from|\{[\s\S]*?\}\s+from)\s+['"]([^'"]+)['"]/g, (match) => {
+  collectMatches(text, /\bexport\s+(?:type\s+)?(?:\*\s+(?:as\s+[A-Za-z_$][\w$]*\s+)?from|\{[\s\S]*?\}\s+from)\s+['"]([^'"]+)['"]/g, (match) => {
     add(match[1], 'export', match.index, match[0], /\bexport\s+type\b/.test(match[0]), importNames(match[0]));
   });
   collectMatches(stripped, /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g, (match) => add(match[1], 'dynamic', match.index, match[0]));
@@ -480,23 +516,25 @@ function extractImports(text: string, stripped: string, file: string): FrontierA
 
 function extractExports(text: string, stripped: string, file: string): FrontierAstExportRecord[] {
   const exports: FrontierAstExportRecord[] = [];
-  const add = (name: string, kind: FrontierAstExportKind, index: number, raw: string, source?: string) => {
-    exports.push({ id: file + ':export:' + exports.length, name, kind, source, range: rangeAt(text, index, raw.length) });
+  const add = (name: string, kind: FrontierAstExportKind, index: number, raw: string, source?: string, localName?: string) => {
+    exports.push({ id: file + ':export:' + exports.length, name, localName, kind, source, range: rangeAt(text, index, raw.length) });
   };
   collectMatches(stripped, /\bexport\s+default\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)?/g, (match) => add(match[1] ?? 'default', 'default', match.index, match[0]));
   collectMatches(stripped, /\bexport\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g, (match) => add(match[1], 'function', match.index, match[0]));
   collectMatches(stripped, /\bexport\s+class\s+([A-Za-z_$][\w$]*)/g, (match) => add(match[1], 'class', match.index, match[0]));
   collectMatches(stripped, /\bexport\s+(const|let|var)\s+([A-Za-z_$][\w$]*)/g, (match) => add(match[2], match[1], match.index, match[0]));
   collectMatches(stripped, /\bexport\s+(type|interface)\s+([A-Za-z_$][\w$]*)/g, (match) => add(match[2], match[1], match.index, match[0]));
-  collectMatches(text, /\bexport\s+\{([^}]+)\}(?:\s+from\s+['"]([^'"]+)['"])?/g, (match) => {
-    for (const name of splitNames(match[1])) add(name, match[2] ? 're-export' : 'default', match.index, match[0], match[2]);
+  collectMatches(text, /\bexport\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"]/g, (match) => add(match[1], 're-export', match.index, match[0], match[2], '*'));
+  collectMatches(text, /\bexport\s+\*\s+from\s+['"]([^'"]+)['"]/g, (match) => add('*', 're-export', match.index, match[0], match[1], '*'));
+  collectMatches(text, /\bexport\s+(?:type\s+)?\{([^}]+)\}(?:\s+from\s+['"]([^'"]+)['"])?/g, (match) => {
+    for (const specifier of splitExportSpecifiers(match[1])) add(specifier.exportedName, match[2] ? 're-export' : 'default', match.index, match[0], match[2], specifier.localName);
   });
   return exports;
 }
 
 function extractDeclarations(stripped: string, file: string, exports: readonly FrontierAstExportRecord[]): FrontierAstDeclarationRecord[] {
   const declarations: FrontierAstDeclarationRecord[] = [];
-  const exported = new Set(exports.map((item) => item.name));
+  const exported = new Set(exports.filter((item) => !item.source).flatMap((item) => [item.name, item.localName].filter(isString)));
   const add = (name: string, kind: FrontierAstDeclarationKind, index: number, raw: string, async = false, explicitExport = false) => {
     declarations.push({
       id: file + ':declaration:' + declarations.length,
@@ -512,6 +550,55 @@ function extractDeclarations(stripped: string, file: string, exports: readonly F
   collectMatches(stripped, /\b(export\s+)?(const|let|var)\s+([A-Za-z_$][\w$]*)/g, (match) => add(match[3], match[2], match.index, match[0], false, Boolean(match[1])));
   collectMatches(stripped, /\b(export\s+)?(type|interface)\s+([A-Za-z_$][\w$]*)/g, (match) => add(match[3], match[2], match.index, match[0], false, Boolean(match[1])));
   return uniqueBy(declarations, (item) => item.kind + ':' + item.name + ':' + item.range.start.index);
+}
+
+function extractSemanticOwnershipRegions(
+  text: string,
+  stripped: string,
+  file: string,
+  exports: readonly FrontierAstExportRecord[],
+  declarations: readonly FrontierAstDeclarationRecord[],
+  owner?: string
+): FrontierAstSemanticOwnershipRegionRecord[] {
+  const regions: FrontierAstSemanticOwnershipRegionRecord[] = [];
+  for (const declaration of declarations) {
+    if (!declaration.exported) continue;
+    const exportRecord = findLocalExportForDeclaration(exports, declaration);
+    const exportName = exportRecord?.name ?? declaration.name;
+    const stableKey = semanticOwnershipStableKey('exported-declaration', declaration.kind, declaration.name, exportName);
+    regions.push({
+      id: semanticOwnershipRegionId(file, stableKey),
+      file,
+      kind: 'exported-declaration',
+      name: declaration.name,
+      stableKey,
+      owner,
+      exportKind: exportRecord?.kind,
+      declarationKind: declaration.kind,
+      exportId: exportRecord?.id,
+      declarationId: declaration.id,
+      range: declarationRegionRange(text, stripped, declaration.range),
+      tags: unique(['semantic-ownership-region', 'exported-declaration', declaration.kind, exportName === declaration.name ? 'named-export' : 'aliased-export'])
+    });
+  }
+  for (const exportRecord of exports) {
+    if (exportRecord.kind !== 're-export') continue;
+    const stableKey = semanticOwnershipStableKey('re-export', exportRecord.source ?? 'unknown-source', exportRecord.name);
+    regions.push({
+      id: semanticOwnershipRegionId(file, stableKey),
+      file,
+      kind: 're-export',
+      name: exportRecord.name,
+      stableKey,
+      owner,
+      exportKind: exportRecord.kind,
+      source: exportRecord.source,
+      exportId: exportRecord.id,
+      range: exportRecord.range,
+      tags: unique(['semantic-ownership-region', 're-export', exportRecord.name === '*' ? 'star-export' : 'named-export'])
+    });
+  }
+  return uniqueBy(regions, (item) => item.id);
 }
 
 function extractCalls(stripped: string, file: string): FrontierAstCallRecord[] {
@@ -600,6 +687,36 @@ function splitNames(value: string): string[] {
     const alias = part.match(/\s+as\s+([A-Za-z_$][\w$]*)$/);
     return alias ? alias[1] : part.replace(/^type\s+/, '').trim();
   });
+}
+
+function splitExportSpecifiers(value: string): Array<{ localName: string; exportedName: string }> {
+  return value.split(',').map((part) => part.trim()).filter(Boolean).map((part) => {
+    const withoutType = part.replace(/^type\s+/, '').trim();
+    const alias = withoutType.match(/^(.+?)\s+as\s+([A-Za-z_$][\w$]*)$/);
+    const localName = alias ? alias[1].trim() : withoutType;
+    return {
+      localName,
+      exportedName: alias ? alias[2] : localName
+    };
+  });
+}
+
+function findLocalExportForDeclaration(exports: readonly FrontierAstExportRecord[], declaration: FrontierAstDeclarationRecord): FrontierAstExportRecord | undefined {
+  return exports.find((item) => !item.source && (item.name === declaration.name || item.localName === declaration.name));
+}
+
+function semanticOwnershipStableKey(kind: string, ...parts: string[]): string {
+  return [kind, ...parts].map(stableIdPart).join(':');
+}
+
+function semanticOwnershipRegionId(file: string, stableKey: string): string {
+  return file + '#semanticOwnershipRegion:' + stableKey;
+}
+
+function stableIdPart(value: string): string {
+  const normalized = value.trim().replace(/\s+/g, '_').replace(/[^A-Za-z0-9_.@/$*-]+/g, '_').replace(/^_+|_+$/g, '');
+  if (normalized === '*') return 'star';
+  return normalized.length > 0 ? normalized : 'anonymous';
 }
 
 function resolveImportTarget(sourceFile: string, specifier: string, byFile: Map<string, FrontierAstSourceRecord>): FrontierAstSourceRecord | undefined {
@@ -692,6 +809,45 @@ function rangeAt(text: string, index: number, length: number): FrontierAstRange 
     start: positionAt(text, index),
     end: positionAt(text, index + length)
   };
+}
+
+function declarationRegionRange(text: string, stripped: string, range: FrontierAstRange): FrontierAstRange {
+  const start = range.start.index;
+  const minimumEnd = range.end?.index ?? start;
+  const end = readDeclarationRegionEnd(stripped, start, minimumEnd);
+  return rangeAt(text, start, Math.max(minimumEnd, end) - start);
+}
+
+function readDeclarationRegionEnd(stripped: string, start: number, minimumEnd: number): number {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let sawBrace = false;
+  for (let index = start; index < stripped.length; index++) {
+    const char = stripped[index];
+    if (char === '(') parenDepth++;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth++;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') {
+      sawBrace = true;
+      braceDepth++;
+    } else if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1);
+      if (sawBrace && braceDepth === 0 && parenDepth === 0 && bracketDepth === 0 && index + 1 >= minimumEnd) return readTrailingSemicolon(stripped, index + 1);
+    } else if (char === ';' && braceDepth === 0 && parenDepth === 0 && bracketDepth === 0 && index + 1 >= minimumEnd) {
+      return index + 1;
+    } else if ((char === '\n' || char === '\r') && !sawBrace && braceDepth === 0 && parenDepth === 0 && bracketDepth === 0 && index >= minimumEnd) {
+      return index;
+    }
+  }
+  return Math.max(minimumEnd, stripped.length);
+}
+
+function readTrailingSemicolon(stripped: string, start: number): number {
+  let index = start;
+  while (index < stripped.length && /[ \t]/.test(stripped[index])) index++;
+  return stripped[index] === ';' ? index + 1 : start;
 }
 
 function positionAt(text: string, index: number): FrontierAstPosition {

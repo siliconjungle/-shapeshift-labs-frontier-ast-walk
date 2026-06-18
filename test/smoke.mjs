@@ -58,6 +58,31 @@ const domain = walkFrontierSource({
 assert.strictEqual(domain.layer, 'domain');
 assert.strictEqual(domain.businessLogic.length, 0);
 
+const semanticOwnership = walkFrontierSource({
+  file: 'packages/domain/src/ownership.ts',
+  text: [
+    'export function alpha() {',
+    '  return 1;',
+    '}',
+    '',
+    'export function beta() {',
+    '  return 2;',
+    '}',
+    '',
+    "export { gamma } from './gamma';",
+    "export * as tools from './tools';"
+  ].join('\n')
+});
+const alphaRegion = semanticOwnership.semanticOwnershipRegions.find((region) => region.kind === 'exported-declaration' && region.name === 'alpha');
+const betaRegion = semanticOwnership.semanticOwnershipRegions.find((region) => region.kind === 'exported-declaration' && region.name === 'beta');
+assert.ok(alphaRegion);
+assert.ok(betaRegion);
+assert.notStrictEqual(alphaRegion.id, betaRegion.id);
+assert.ok(alphaRegion.id.includes('exported-declaration:function:alpha:alpha'));
+assert.ok(betaRegion.id.includes('exported-declaration:function:beta:beta'));
+assert.ok(semanticOwnership.semanticOwnershipRegions.some((region) => region.kind === 're-export' && region.name === 'gamma' && region.source === './gamma'));
+assert.ok(semanticOwnership.semanticOwnershipRegions.some((region) => region.kind === 're-export' && region.name === 'tools' && region.source === './tools'));
+
 const graph = walkFrontierSources([
   {
     file: 'apps/web/src/routes/index.tsx',
@@ -77,9 +102,13 @@ assert.strictEqual(graph.summary.sourceCount, 3);
 assert.ok(graph.edges.some((edge) => edge.from.endsWith('routes/index.tsx') && edge.to.endsWith('components/HomeView.tsx')));
 assert.ok(traceImportClosure(graph, ['apps/web/src/routes/index.tsx']).some((id) => id.endsWith('packages/domain/src/todos.ts')));
 
+const semanticGraph = walkFrontierSources([semanticOwnership]);
+assert.strictEqual(semanticGraph.summary.semanticOwnershipRegionCount, semanticOwnership.semanticOwnershipRegions.length);
+
 const registry = createAstRegistryGraph(graph);
 assert.ok(registry.entries.some((entry) => entry.kind === 'declaration' && entry.id.includes('calculateRevenue')));
 assert.ok(registry.edges.some((edge) => edge.kind === 'imports'));
+assert.ok(createAstRegistryGraph(semanticGraph).entries.some((entry) => entry.kind === 'semantic-ownership-region' && entry.id === alphaRegion.id));
 
 const lintResources = createAstLintResources(graph);
 assert.ok(lintResources.some((resource) => resource.files.includes('apps/web/src/components/HomeView.tsx') && resource.imports.length === 1));

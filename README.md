@@ -2,7 +2,7 @@
 
 Dependency-light source graph and business-logic analysis for Frontier apps and tools.
 
-`frontier-ast-walk` extracts imports, exports, declarations, call sites, Frontier package usage, source layers, import edges, registry graph entries, and business-logic findings from JavaScript and TypeScript source text. It is intended to feed `frontier-framework`, `frontier-linter`, documentation, previews, fuzzers, benchmarks, and agent evidence without making each tool invent its own source scan.
+`frontier-ast-walk` extracts imports, exports, declarations, semantic ownership regions, call sites, Frontier package usage, source layers, import edges, registry graph entries, and business-logic findings from JavaScript and TypeScript source text. It is intended to feed `frontier-framework`, `frontier-linter`, documentation, previews, fuzzers, benchmarks, and agent evidence without making each tool invent its own source scan.
 
 
 ## Related Packages
@@ -220,6 +220,21 @@ const graph = walkFrontierSources([
 ]);
 
 const touched = traceImportClosure(graph, ['apps/web/src/routes/index.tsx']);
+```
+
+## Semantic Ownership Regions
+
+Each source record includes `semanticOwnershipRegions`, a dependency-light summary intended for agent and semantic-merge evidence. Regions are emitted for exported declarations and re-exports. Each region includes a stable `id`, `stableKey`, `kind`, `name`, optional `source`, optional declaration/export ids, a source `range`, and tags such as `exported-declaration` or `re-export`.
+
+The stable id is derived from the normalized file plus the exported declaration or re-export target rather than discovery order, so two independent exports in the same file can be reviewed as separate merge regions:
+
+```ts
+const source = walkFrontierSource({
+  file: 'packages/domain/src/math.ts',
+  text: 'export function add() { return 1; }\nexport function subtract() { return 2; }\n'
+});
+
+source.semanticOwnershipRegions.map((region) => region.id);
 ```
 
 ## Business Logic Policy
